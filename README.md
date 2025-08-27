@@ -2,10 +2,9 @@
 
 Introducción al Procesamiento Digital de Imágenes
 
-Grupo 7
-
 Rios Daniel Ricardo
 
 Miranda Erick Enrique
 
 Fascio Mateo Lucas
+
