@@ -29,3 +29,10 @@ def change_intensity(_im, alpha=1, beta=1):
     _yiq = rgb2yiq(_im) * np.array([alpha, beta, beta])[np.newaxis, np.newaxis, :]
     _rgb = yiq2rgb(_yiq)
     return _rgb
+
+def _convolution(image, kernel = np.ones((1,1))):
+    convolved = np.zeros((np.array(image.shape)-np.array(kernel.shape)+1))
+    for x in range(convolved.shape[0]):
+        for y in range(convolved.shape[1]):
+            convolved[x,y] = (image[x:x+kernel.shape[0],y:y+kernel.shape[1]]*kernel).sum()
+    return convolved
