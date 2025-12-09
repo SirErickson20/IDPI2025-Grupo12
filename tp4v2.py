@@ -1,383 +1,369 @@
-# -*- coding: utf-8 -*-
-"""
-PDI – Procesamiento por convolución (FI-UNJu)
-
-App Tkinter que:
-- Carga una imagen (RGB o gris).
-- La convierte a nivel de gris (luminancia).
-- Aplica filtrado por convolución con padding de REPETICIÓN DE BORDES.
-- Filtros implementados:
-
-1) Pasabajos:
-   - Plano 3x3, 5x5, 7x7
-   - Bartlett 3x3, 5x5, 7x7
-   - Gaussiano 5x5, 7x7 (aprox. Pascal)
-
-2) Detectores de bordes:
-   - Laplaciano v4, Laplaciano v8
-   - Sobel 8 orientaciones (N, NE, E, SE, S, SW, W, NW)
-
-3) Pasabanda y pasaaltos (frecuencia de corte ~0.2 y ~0.4)
-   - Pasaaltos fc=0.2 ≈ identidad - LP gaussiano 7x7
-   - Pasaaltos fc=0.4 ≈ identidad - LP gaussiano 5x5
-   - Pasabanda fc=0.2 ≈ LP5 - LP7
-   - Pasabanda fc=0.4 ≈ LP3 - LP5 (usando pasabajos plano 3x3 y gaussiano 5x5)
-
-Padding: replicación de bordes (edge), como pide el enunciado.
-"""
-
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
-from PIL import Image, ImageTk
 import numpy as np
+from PIL import Image, ImageTk
+import cv2  # <- USAMOS OPENCV PARA LA CONVOLUCIÓN RÁPIDA
 
-# ====================
-# Kernels auxiliares
-# ====================
+# ==============================================================================
+# 1. Conversión RGB -> YIQ
+# ==============================================================================
 
-def mean_kernel(size: int) -> np.ndarray:
-    """Kernel pasabajos plano (todos unos normalizados)."""
-    k = np.ones((size, size), dtype=np.float64)
-    return k / k.size
+MAT_YIQ = np.array([
+    [0.299,      0.595716,  0.211456],
+    [0.587,     -0.274453, -0.522591],
+    [0.114,     -0.321263,  0.311135]
+])
 
-def bartlett_kernel(size: int) -> np.ndarray:
-    """Kernel Bartlett (triangular 1D -> outer product, normalizado)."""
-    assert size in (3, 5, 7)
-    n = size // 2
-    seq = np.array(list(range(1, n + 2)) + list(range(n, 0, -1)), dtype=np.float64)
-    k = np.outer(seq, seq)
-    return k / np.sum(k)
+def rgb2yiq(_im):
+    """Convierte una imagen RGB (numpy, 0-255) a YIQ (float, 0-1)."""
+    _im_float = _im.astype(np.float64) / 255.0
+    _rgb = _im_float.reshape((-1, 3))
+    _yiq = _rgb @ MAT_YIQ
+    _yiq = _yiq.reshape(_im_float.shape)
+    return _yiq
 
-def gauss_kernel_pascal(size: int) -> np.ndarray:
-    """Kernel Gaussiano aproximado usando filas del triángulo de Pascal."""
-    assert size in (5, 7)
-    if size == 5:
-        row = np.array([1, 4, 6, 4, 1], dtype=np.float64)
+# ==============================================================================
+# 2. DEFINICIÓN Y GENERACIÓN DE KERNELS
+# ==============================================================================
+
+# --- Pasa bajos: Plano ---
+def create_plano_kernel(size):
+    """Crea un kernel Plano (Promedio)."""
+    kernel = np.ones((size, size), dtype=np.float64)
+    return kernel / kernel.sum()
+
+# --- Pasa bajos: Bartlett ---
+def create_bartlett_kernel(size):
+    """Crea un kernel Bartlett (Pirámide Triangular)."""
+    center = size // 2
+    profile = np.abs(np.arange(size) - center)
+    weights = center - profile
+    weights = weights / weights[center]
+    kernel = np.outer(weights, weights)
+    return kernel / kernel.sum()
+
+# --- Pasa bajos: Gaussiano ---
+def get_gaussian_kernel(size, sigma):
+    """Genera un kernel Gaussiano 2D."""
+    center = size // 2
+    x, y = np.mgrid[-center:center+1, -center:center+1]
+    g = np.exp(-(x**2 + y**2) / (2 * sigma**2))
+    return g / g.sum()
+
+def create_gaussian_kernel(size):
+    """Crea un kernel Gaussiano con sigma predefinido por tamaño."""
+    sigma = (size - 1) / 4
+    if sigma < 0.8:
+        sigma = 0.8
+    return get_gaussian_kernel(size, sigma)
+
+# --- Laplaciano (pasa altos) ---
+KERNEL_LAPLACIANO_V4 = np.array([[0,  1,  0],
+                                 [1, -4,  1],
+                                 [0,  1,  0]], dtype=np.float64)
+
+KERNEL_LAPLACIANO_V8 = np.array([[ 1,  1,  1],
+                                 [ 1, -8,  1],
+                                 [ 1,  1,  1]], dtype=np.float64)
+
+# --- Sobel 4 orientaciones ---
+def create_sobel_kernel(direction):
+    """
+    Crea un kernel Sobel 3x3 para las 4 orientaciones cardinales.
+    direction: 'E', 'N', 'W', 'S'
+    """
+    Gx = np.array([[-1, 0, 1],
+                   [-2, 0, 2],
+                   [-1, 0, 1]], dtype=np.float64)
+    Gy = np.array([[-1, -2, -1],
+                   [ 0,  0,  0],
+                   [ 1,  2,  1]], dtype=np.float64)
+
+    if direction == 'E':
+        return Gx
+    elif direction == 'W':
+        return -Gx
+    elif direction == 'N':
+        return Gy
+    elif direction == 'S':
+        return -Gy
     else:
-        # fila de 7 elementos del triángulo de Pascal
-        row = np.array([1, 6, 15, 20, 15, 6, 1], dtype=np.float64)
-    k = np.outer(row, row)
-    return k / np.sum(k)
+        raise ValueError("Dirección de Sobel no válida. Use 'N', 'S', 'E', 'W'.")
 
-# Laplacianos
-LAPLACE_V4 = np.array([[0,  1, 0],
-                       [1, -4, 1],
-                       [0,  1, 0]], dtype=np.float64)
+# --- Filtros por frecuencia (opcional, los dejo igual) ---
+def create_lowpass_gaussian_by_freq(size, cutoff_freq):
+    """Crea un kernel LPF Gaussiano usando frecuencia de corte (para HPF/BPF)."""
+    if cutoff_freq <= 0:
+        return np.ones((size, size), dtype=np.float64) / (size * size)
+    sigma = 1 / (2 * np.pi * cutoff_freq)
+    return get_gaussian_kernel(size, sigma)
 
-LAPLACE_V8 = np.array([[1,  1, 1],
-                       [1, -8, 1],
-                       [1,  1, 1]], dtype=np.float64)
+def create_highpass_kernel(size, cutoff_freq):
+    """Crea un kernel PasaAltos (HPF = Identidad - LPF)."""
+    lpf_kernel = create_lowpass_gaussian_by_freq(size, cutoff_freq)
+    identity_kernel = np.zeros((size, size), dtype=np.float64)
+    identity_kernel[size // 2, size // 2] = 1.0
+    return identity_kernel - lpf_kernel
 
-# Sobel 8 orientaciones (3x3)
-SOBEL_KERNELS = {
-    "Sobel Norte": np.array([[ 1,  2,  1],
-                             [ 0,  0,  0],
-                             [-1, -2, -1]], dtype=np.float64),
+def create_bandpass_kernel(size_small, size_large, cutoff_freq_small, cutoff_freq_large):
+    """Crea un filtro PasaBanda (BPF) como diferencia de Gaussianas (DOG)."""
+    sigma1 = 1 / (2 * np.pi * cutoff_freq_large)
+    lpf1 = get_gaussian_kernel(size_large, sigma1)
 
-    "Sobel Sur": np.array([[-1, -2, -1],
-                           [ 0,  0,  0],
-                           [ 1,  2,  1]], dtype=np.float64),
+    sigma2 = 1 / (2 * np.pi * cutoff_freq_small)
+    lpf2 = get_gaussian_kernel(size_small, sigma2)
 
-    "Sobel Este": np.array([[-1,  0,  1],
-                            [-2,  0,  2],
-                            [-1,  0,  1]], dtype=np.float64),
+    pad_size = (size_large - size_small) // 2
+    lpf2_padded = np.pad(lpf2,
+                         ((pad_size, pad_size), (pad_size, pad_size)),
+                         mode='constant')
 
-    "Sobel Oeste": np.array([[ 1,  0, -1],
-                             [ 2,  0, -2],
-                             [ 1,  0, -1]], dtype=np.float64),
+    bpf_kernel = lpf2_padded - lpf1
+    bpf_kernel = bpf_kernel / np.abs(bpf_kernel).sum()
+    return bpf_kernel
 
-    "Sobel Noreste": np.array([[ 0,  1,  2],
-                               [-1,  0,  1],
-                               [-2, -1,  0]], dtype=np.float64),
+# ==============================================================================
+# 3. Lógica de filtrado usando OpenCV (rápido, mantiene tamaño)
+# ==============================================================================
 
-    "Sobel Noroeste": np.array([[ 2,  1,  0],
-                               [ 1,  0, -1],
-                               [ 0, -1, -2]], dtype=np.float64),
-
-    "Sobel Sudeste": np.array([[-2, -1,  0],
-                               [-1,  0,  1],
-                               [ 0,  1,  2]], dtype=np.float64),
-
-    "Sobel Sudoeste": np.array([[ 0, -1, -2],
-                                [ 1,  0, -1],
-                                [ 2,  1,  0]], dtype=np.float64),
-}
-
-# ====================
-# Convolución con padding por replicación
-# ====================
-
-def convolve_replicate(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+def apply_filter_logic(image_np, kernel):
     """
-    Convolución 2D con padding de replicación de bordes.
-    img: imagen en float64 normalizada [0,1], 2D.
-    kernel: matriz cuadrada impar.
+    Aplica el filtro sobre el canal Y usando cv2.filter2D.
+    Mantiene el tamaño original de la imagen.
     """
-    k = kernel.shape[0]
-    assert kernel.shape[0] == kernel.shape[1], "Kernel debe ser cuadrado"
-    r = k // 2
+    # Convertir a YIQ y tomar canal Y
+    yiq_image = rgb2yiq(image_np)
+    y_channel = yiq_image[:, :, 0].astype(np.float32)
 
-    # padding por réplica de filas/columnas
-    padded = np.pad(img, pad_width=r, mode="edge")
+    # Convolución 2D con borde replicado (equivalente a tu padding 'edge')
+    kernel = kernel.astype(np.float32)
+    y_filtered = cv2.filter2D(y_channel, -1, kernel, borderType=cv2.BORDER_REPLICATE)
 
-    h, w = img.shape
-    out = np.zeros_like(img, dtype=np.float64)
+    # Normalizar a 0–255 para mostrar
+    y_min = float(y_filtered.min())
+    y_max = float(y_filtered.max())
 
-    for i in range(h):
-        for j in range(w):
-            region = padded[i:i + k, j:j + k]
-            out[i, j] = np.sum(region * kernel)
+    if y_max != y_min:
+        y_normalized = (y_filtered - y_min) / (y_max - y_min)
+    else:
+        y_normalized = np.zeros_like(y_filtered, dtype=np.float32)
 
-    # para la mayoría de los filtros queremos forzar a [0,1]
-    out = np.clip(out, 0.0, 1.0)
-    return out
+    y_display = (y_normalized * 255).clip(0, 255).astype(np.uint8)
+    return y_display
 
-# ====================
-# App Tkinter
-# ====================
+# ==============================================================================
+# 4. Interfaz Tkinter
+# ==============================================================================
 
-FILTERS = [
-    # Pasabajos plano
-    "Pasabajos plano 3x3",
-    "Pasabajos plano 5x5",
-    "Pasabajos plano 7x7",
-    # Bartlett
-    "Pasabajos Bartlett 3x3",
-    "Pasabajos Bartlett 5x5",
-    "Pasabajos Bartlett 7x7",
-    # Gauss
-    "Pasabajos Gaussiano 5x5",
-    "Pasabajos Gaussiano 7x7",
-    # Laplaciano
-    "Laplaciano v4",
-    "Laplaciano v8",
-    # Sobel 8 orientaciones
-    "Sobel Norte",
-    "Sobel Noreste",
-    "Sobel Este",
-    "Sobel Sudeste",
-    "Sobel Sur",
-    "Sobel Sudoeste",
-    "Sobel Oeste",
-    "Sobel Noroeste",
-    # Pasaaltos / Pasabanda
-    "Pasaaltos fc=0.2",
-    "Pasaaltos fc=0.4",
-    "Pasabanda fc=0.2",
-    "Pasabanda fc=0.4",
-]
+class ImageProcessorApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Filtrado por Convolución - PDI UNS")
 
+        # Para evitar AttributeError
+        self.original_image_pil = None
+        self.original_image_np = None
+        self.filtered_image_pil = None
+        self.original_image_tk = None
+        self.filtered_image_tk_filtered = None
 
-class ConvolucionApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("PDI – Procesamiento por convolución")
-        self.geometry("1200x720")
-        self.minsize(1000, 600)
+        # Opciones de filtros
+        self.fixed_filter_options = {
+            # PasaBajos: Plano
+            "Plano 3x3":       lambda: create_plano_kernel(3),
+            "Plano 5x5":       lambda: create_plano_kernel(5),
+            "Plano 7x7":       lambda: create_plano_kernel(7),
 
-        self.img_gray = None      # PIL (L) original
-        self.img_gray_arr = None  # numpy float [0,1]
-        self.img_out = None       # PIL (L) resultado
+            # PasaBajos: Bartlett
+            "Bartlett 3x3":    lambda: create_bartlett_kernel(3),
+            "Bartlett 5x5":    lambda: create_bartlett_kernel(5),
+            "Bartlett 7x7":    lambda: create_bartlett_kernel(7),
 
-        self.tk_orig = None
-        self.tk_out = None
+            # PasaBajos: Gaussiano
+            "Gaussiano 5x5":   lambda: create_gaussian_kernel(5),
+            "Gaussiano 7x7":   lambda: create_gaussian_kernel(7),
 
-        self.filter_var = tk.StringVar(value=FILTERS[0])
-        self.autoupdate = tk.BooleanVar(value=True)
+            # Laplaciano
+            "Laplaciano v4":   KERNEL_LAPLACIANO_V4,
+            "Laplaciano v8":   KERNEL_LAPLACIANO_V8,
 
-        # precalcular algunos kernels reutilizados
-        self.kernel_gauss5 = gauss_kernel_pascal(5)
-        self.kernel_gauss7 = gauss_kernel_pascal(7)
-        self.kernel_mean3 = mean_kernel(3)
+            # Sobel 4 orientaciones
+            "Sobel (Este, 0°)":   lambda: create_sobel_kernel('E'),
+            "Sobel (Norte, 90°)": lambda: create_sobel_kernel('N'),
+            "Sobel (Oeste, 180°)":lambda: create_sobel_kernel('W'),
+            "Sobel (Sur, 270°)":  lambda: create_sobel_kernel('S'),
 
-        self._build_ui()
+            # Filtros de frecuencia
+            "PasaAltos (corte 0.2)":      lambda: create_highpass_kernel(size=5, cutoff_freq=0.2),
+            "PasaAltos (corte 0.4)":      lambda: create_highpass_kernel(size=5, cutoff_freq=0.4),
+            "PasaBanda (DOG 5x5/3x3)":    lambda: create_bandpass_kernel(
+                                                size_small=3, size_large=5,
+                                                cutoff_freq_small=0.4, cutoff_freq_large=0.2)
+        }
 
-    def _build_ui(self):
-        top = ttk.Frame(self)
-        top.pack(side=tk.TOP, fill=tk.X, padx=10, pady=8)
+        self.selected_filter = tk.StringVar(master)
+        self.selected_filter.set("Gaussiano 5x5")
 
-        ttk.Button(top, text="📂 Cargar imagen", command=self.load_image).pack(side=tk.LEFT)
-        ttk.Label(top, text="   Filtro:").pack(side=tk.LEFT, padx=(16, 4))
-        cb = ttk.Combobox(top, textvariable=self.filter_var, values=FILTERS,
-                          state="readonly", width=32)
-        cb.pack(side=tk.LEFT)
-        cb.bind("<<ComboboxSelected>>", lambda e: self._maybe_auto())
+        # Layout principal
+        main_frame = ttk.Frame(master, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        master.columnconfigure(0, weight=1)
+        master.rowconfigure(0, weight=1)
 
-        ttk.Checkbutton(top, text="Actualizar automáticamente",
-                        variable=self.autoupdate).pack(side=tk.LEFT, padx=12)
-        ttk.Button(top, text="▶ Aplicar", command=self.apply_filter).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(top, text="💾 Guardar resultado", command=self.save_output).pack(side=tk.LEFT, padx=(8, 0))
+        # Frame de imágenes
+        img_frame = ttk.Frame(main_frame)
+        img_frame.grid(row=0, column=0, columnspan=2, pady=10, sticky="nsew")
+        img_frame.columnconfigure(0, weight=1)
+        img_frame.columnconfigure(1, weight=1)
 
-        mid = ttk.Frame(self)
-        mid.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=8)
-
-        lf1 = ttk.LabelFrame(mid, text="Imagen gris / luminancia (entrada)")
-        lf1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-        self.lbl_orig = ttk.Label(lf1, anchor="center")
-        self.lbl_orig.pack(fill=tk.BOTH, expand=True)
-
-        lf2 = ttk.LabelFrame(mid, text="Resultado filtrado (salida)")
-        lf2.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
-        self.lbl_out = ttk.Label(lf2, anchor="center")
-        self.lbl_out.pack(fill=tk.BOTH, expand=True)
-
-        self.status = tk.StringVar(
-            value="Cargá una imagen. Se convierte a gris/luminancia y se filtra por convolución."
+        self.label_original = ttk.Label(
+            img_frame, text="[IMAGEN ORIGINAL]", anchor="center",
+            relief="groove", width=50
         )
-        ttk.Label(self, textvariable=self.status, anchor="w").pack(side=tk.BOTTOM, fill=tk.X)
+        self.label_original.grid(row=0, column=0, padx=10, pady=5, sticky="nsew")
 
-    # ------------- utilidades de UI -------------
+        self.label_filtered = ttk.Label(
+            img_frame, text="[IMAGEN FILTRADA]", anchor="center",
+            relief="groove", width=50
+        )
+        self.label_filtered.grid(row=0, column=1, padx=10, pady=5, sticky="nsew")
 
-    def _fit(self, pil_img, label):
-        lw = label.winfo_width() or 1
-        lh = label.winfo_height() or 1
-        iw, ih = pil_img.size
-        s = min(lw / iw, lh / ih)
-        s = max(1e-6, min(s, 1.0))
-        return pil_img.resize((max(1, int(iw * s)), max(1, int(ih * s))), Image.LANCZOS)
+        ttk.Label(img_frame, text="Imagen Original",
+                  font=('Arial', 10, 'bold')).grid(row=1, column=0)
+        ttk.Label(img_frame, text="Imagen Filtrada (Canal Y)",
+                  font=('Arial', 10, 'bold')).grid(row=1, column=1)
 
-    def _refresh_images(self):
-        if self.img_gray is not None:
-            x = self._fit(self.img_gray, self.lbl_orig)
-            self.tk_orig = ImageTk.PhotoImage(x)
-            self.lbl_orig.configure(image=self.tk_orig)
+        # Controles
+        control_frame = ttk.Frame(main_frame, padding="10 0 10 0")
+        control_frame.grid(row=2, column=0, columnspan=2, pady=10)
 
-        if self.img_out is not None:
-            y = self._fit(self.img_out, self.lbl_out)
-            self.tk_out = ImageTk.PhotoImage(y)
-            self.lbl_out.configure(image=self.tk_out)
+        ttk.Button(control_frame, text="Cargar Imagen",
+                   command=self.load_image).grid(row=0, column=0, padx=5)
 
-    def _maybe_auto(self):
-        if self.autoupdate.get():
-            self.apply_filter()
+        self.filter_combobox = ttk.Combobox(
+            control_frame,
+            textvariable=self.selected_filter,
+            state="readonly",
+            values=list(self.fixed_filter_options.keys())
+        )
+        self.filter_combobox.grid(row=0, column=1, padx=5)
 
-    # ------------- IO -------------
+        ttk.Button(control_frame, text="Aplicar Filtro →",
+                   command=self.process_image).grid(row=0, column=2, padx=5)
 
+        self.save_button = ttk.Button(
+            control_frame, text="Guardar Imagen",
+            command=self.save_image, state=tk.DISABLED
+        )
+        self.save_button.grid(row=0, column=3, padx=5)
+
+    # ------------------------------------------------------------------
+    # Métodos de la app
+    # ------------------------------------------------------------------
     def load_image(self):
-        path = filedialog.askopenfilename(
-            title="Seleccionar imagen",
-            filetypes=[("Imágenes", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff")]
+        filepath = filedialog.askopenfilename(
+            title="Seleccionar Imagen RGB",
+            filetypes=[("Archivos de Imagen", "*.png *.jpg *.jpeg *.bmp *.tiff")]
         )
-        if not path:
+        if not filepath:
             return
         try:
-            img = Image.open(path)
+            self.original_image_pil = Image.open(filepath).convert("RGB")
+            self.original_image_np = np.array(self.original_image_pil)
+            self.filtered_image_pil = None
+            self.update_image_display()
         except Exception as e:
-            messagebox.showerror("Error", f"No se pudo abrir la imagen:\n{e}")
-            return
+            messagebox.showerror("Error de Carga",
+                                 f"No se pudo cargar la imagen.\n\nDetalle: {e}")
 
-        # Convertir a nivel de gris (luminancia)
-        self.img_gray = img.convert("L")  # PIL interno hace combinación de canales
-        arr_u8 = np.array(self.img_gray, dtype=np.uint8)
-        self.img_gray_arr = arr_u8.astype(np.float64) / 255.0
+    def update_image_display(self):
+        max_size = 400  # SOLO para mostrar; el procesamiento es a tamaño completo
 
-        self.img_out = None
-        self._refresh_images()
-        self.status.set(f"Imagen cargada: {path} – tamaño {self.img_gray.size[0]}x{self.img_gray.size[1]}")
-        self._maybe_auto()
-
-    def save_output(self):
-        if self.img_out is None:
-            messagebox.showinfo("Guardar", "No hay resultado todavía.")
-            return
-        path = filedialog.asksaveasfilename(
-            title="Guardar resultado",
-            defaultextension=".png",
-            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg;*.jpeg"), ("BMP", "*.bmp")]
-        )
-        if not path:
-            return
-        try:
-            self.img_out.save(path)
-            self.status.set(f"Resultado guardado en: {path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"No se pudo guardar:\n{e}")
-
-    # ------------- núcleo: selección de filtro -------------
-
-    def apply_filter(self):
-        if self.img_gray_arr is None:
-            return
-
-        f = self.filter_var.get()
-        img = self.img_gray_arr
-
-        # 1) Pasabajos
-        if f == "Pasabajos plano 3x3":
-            kernel = mean_kernel(3)
-            out = convolve_replicate(img, kernel)
-        elif f == "Pasabajos plano 5x5":
-            kernel = mean_kernel(5)
-            out = convolve_replicate(img, kernel)
-        elif f == "Pasabajos plano 7x7":
-            kernel = mean_kernel(7)
-            out = convolve_replicate(img, kernel)
-        elif f == "Pasabajos Bartlett 3x3":
-            kernel = bartlett_kernel(3)
-            out = convolve_replicate(img, kernel)
-        elif f == "Pasabajos Bartlett 5x5":
-            kernel = bartlett_kernel(5)
-            out = convolve_replicate(img, kernel)
-        elif f == "Pasabajos Bartlett 7x7":
-            kernel = bartlett_kernel(7)
-            out = convolve_replicate(img, kernel)
-        elif f == "Pasabajos Gaussiano 5x5":
-            out = convolve_replicate(img, self.kernel_gauss5)
-        elif f == "Pasabajos Gaussiano 7x7":
-            out = convolve_replicate(img, self.kernel_gauss7)
-
-        # 2) Laplaciano
-        elif f == "Laplaciano v4":
-            # puede producir valores negativos o >1, por eso luego se recorta
-            out = convolve_replicate(img, LAPLACE_V4)
-        elif f == "Laplaciano v8":
-            out = convolve_replicate(img, LAPLACE_V8)
-
-        # 3) Sobel 8 direcciones
-        elif f in SOBEL_KERNELS:
-            k = SOBEL_KERNELS[f]
-            # Sobel puede dar valores negativos; tomamos valor absoluto y reescalamos
-            resp = convolve_replicate(img, k)
-            out = np.abs(resp)
-            out = out / (out.max() + 1e-8)
-        # 4) Pasaaltos / Pasabanda
-        elif f == "Pasaaltos fc=0.2":
-            # fc más baja: usamos blur más fuerte (gauss7)
-            low = convolve_replicate(img, self.kernel_gauss7)
-            hp = img - low
-            hp = (hp - hp.min()) / (hp.max() - hp.min() + 1e-8)
-            out = hp
-        elif f == "Pasaaltos fc=0.4":
-            # fc más alta: blur más suave (gauss5)
-            low = convolve_replicate(img, self.kernel_gauss5)
-            hp = img - low
-            hp = (hp - hp.min()) / (hp.max() - hp.min() + 1e-8)
-            out = hp
-        elif f == "Pasabanda fc=0.2":
-            # banda media: diferencia entre LP5 y LP7
-            low5 = convolve_replicate(img, self.kernel_gauss5)
-            low7 = convolve_replicate(img, self.kernel_gauss7)
-            bp = low5 - low7
-            bp = (bp - bp.min()) / (bp.max() - bp.min() + 1e-8)
-            out = bp
-        elif f == "Pasabanda fc=0.4":
-            # otra banda: diferencia entre pasabajos 3x3 y gauss5
-            low3 = convolve_replicate(img, self.kernel_mean3)
-            low5 = convolve_replicate(img, self.kernel_gauss5)
-            bp = low3 - low5
-            bp = (bp - bp.min()) / (bp.max() - bp.min() + 1e-8)
-            out = bp
+        # Original
+        if self.original_image_pil is not None:
+            img_disp_orig = self.original_image_pil.copy()
+            img_disp_orig.thumbnail((max_size, max_size))
+            self.original_image_tk = ImageTk.PhotoImage(img_disp_orig)
+            self.label_original.config(image=self.original_image_tk, text="")
         else:
-            out = img.copy()
+            self.label_original.config(image="", text="[IMAGEN ORIGINAL]")
 
-        # convertir a imagen PIL en escala de grises
-        out_u8 = (np.clip(out, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-        self.img_out = Image.fromarray(out_u8, mode="L")
-        self._refresh_images()
-        self.status.set(f"Filtro aplicado: {f}")
+        # Filtrada
+        if self.filtered_image_pil is not None:
+            img_disp_filt = self.filtered_image_pil.copy()
+            img_disp_filt.thumbnail((max_size, max_size))
+            self.filtered_image_tk_filtered = ImageTk.PhotoImage(img_disp_filt)
+            self.label_filtered.config(image=self.filtered_image_tk_filtered, text="")
+            self.save_button.config(state=tk.NORMAL)
+        else:
+            self.label_filtered.config(image="", text="[IMAGEN FILTRADA]")
+            self.save_button.config(state=tk.DISABLED)
+
+    def process_image(self):
+        if self.original_image_np is None:
+            messagebox.showwarning("Advertencia",
+                                   "Primero debes cargar una imagen.")
+            return
+
+        try:
+            filter_name = self.selected_filter.get()
+            filter_item = self.fixed_filter_options[filter_name]
+
+            if callable(filter_item):
+                kernel = filter_item()
+            else:
+                kernel = filter_item
+
+            y_filtered_array = apply_filter_logic(self.original_image_np, kernel)
+
+            if y_filtered_array is None:
+                return
+
+            self.filtered_image_pil = Image.fromarray(y_filtered_array, mode='L')
+            self.update_image_display()
+
+        except Exception as e:
+            messagebox.showerror("Error de Procesamiento",
+                                 f"Error al aplicar el filtro.\n\nDetalle: {e}")
+
+    def save_image(self):
+        if self.filtered_image_pil is None:
+            messagebox.showwarning("Advertencia",
+                                   "Aplica un filtro antes de guardar.")
+            return
+
+        filetypes = [
+            ("PNG (Portable Network Graphics)", "*.png"),
+            ("BMP (Bitmap)", "*.bmp"),
+            ("TIFF (Tagged Image File Format)", "*.tiff"),
+            ("Todos los archivos", "*.*")
+        ]
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=filetypes,
+            title="Guardar Imagen Filtrada"
+        )
+
+        if not filepath:
+            return
+
+        save_format = filepath.split('.')[-1].upper()
+        if save_format == 'TIF':
+            save_format = 'TIFF'
+        elif save_format in ('JPG', 'JPEG'):
+            save_format = 'JPEG'
+
+        try:
+            self.filtered_image_pil.save(filepath, format=save_format)
+            messagebox.showinfo("Guardado Exitoso",
+                                f"Imagen guardada en:\n{filepath}\ncomo {save_format}.")
+        except Exception as e:
+            messagebox.showerror("Error al Guardar",
+                                 f"No se pudo guardar la imagen:\n\n{e}")
 
 
-if __name__ == "__main__":
-    app = ConvolucionApp()
-    app.update_idletasks()
-    app.mainloop()
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = ImageProcessorApp(root)
+    root.mainloop()
