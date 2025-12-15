@@ -2,10 +2,8 @@
 
 Introducción al Procesamiento Digital de Imágenes
 
-Rios Daniel Ricardo
-
-Miranda Erick Enrique
-
-Fascio Mateo Lucas
+# MIRANDA, ERICK ENRIQUE
+# RIOS, DANIEL RICARDO
+# SERRANO, EDUARDO ALFREDO ADRIÁN
 
 
